@@ -1,6 +1,8 @@
 # About
 
-AI Chatbot for SOP repo, Reads a SOP directory with md and asciidoc and text files to provide answers 
+AI chatbot for SOP libraries. Loads markdown, asciidoc, and text files from **local directories** and **GitHub/GitLab repos**, then answers questions via Ollama (mistral) with source citations.
+
+Remote repos are fetched over the HTTP API — nothing is cloned to disk.
 
 # Prereq
 
@@ -8,35 +10,49 @@ AI Chatbot for SOP repo, Reads a SOP directory with md and asciidoc and text fil
 - python 3
 - c++ > 11
 
-# setup 
+# setup
 
-Run ollama with mistral, this should be run in parrell with the python application
 ```bash
 ollama run mistral
 ```
-Install dependances 
+
 ```bash
 sudo dnf install gcc-c++ python3-devel
-pip install langchain chromadb sentence-transformers ollama
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt 
+pip install -r requirements.txt
 ```
 
-# Running 
+# Running
+
+Start the web GUI (optionally with one or more sources):
 
 ```bash
 python main.py
+python main.py /path/to/sops
+python main.py /path/a /path/b https://github.com/org/sop-repo
 ```
-expected cli interface e.g.
+
+With no arguments the app starts empty — use the **Sources** panel in the UI to add directories or repos. You can also set `SOP_DIR` or `SOP_SOURCES` (path-separated list).
+
+Open http://127.0.0.1:5000
+
+Options:
 
 ```bash
-🤖 SOP Assistant ready. Type your question below. Type 'exit' to quit.
-
-📝 You: redis is full
-
-🤖 Assistant:
-  To address a situation where Redis is full, you can follow these steps:...
-
+python main.py /path/to/sops --host 0.0.0.0 --port 8080
+python main.py /path/to/sops --cli
 ```
 
+Private repos — set a token before starting, or paste it in the UI:
+
+```bash
+export GIT_TOKEN=...   # or GITHUB_TOKEN / GITLAB_TOKEN
+python main.py https://gitlab.com/org/private-sops
+```
+
+# CLI example
+
+```bash
+python main.py /path/to/sops --cli
+```

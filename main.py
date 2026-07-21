@@ -1,52 +1,179 @@
-from utils.loaders import load_sop_files
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain.chains import RetrievalQA
-from langchain_ollama import OllamaLLM
-from langchain_huggingface import HuggingFaceEmbeddings
+import argparse
+import os
+from pathlib import Path
+
+from flask import Flask, jsonify, request, send_from_directory
+
+from utils.rag import SopIndex, build_index
+
+ROOT = Path(__file__).resolve().parent
+app = Flask(__name__, static_folder=str(ROOT))
+index: SopIndex | None = None
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="SOP Assistant — ask questions about local dirs and git repos."
+    )
+    parser.add_argument(
+        "sources",
+        nargs="*",
+        default=None,
+        help="One or more SOP directories or GitHub/GitLab URLs.",
+    )
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Run in terminal chat mode instead of the web GUI.",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Web server host (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=5000,
+        help="Web server port (default: 5000).",
+    )
+    parser.add_argument(
+        "--model",
+        default="mistral",
+        help="Ollama model name (default: mistral).",
+    )
+    return parser.parse_args()
 
 
-# Load and prepare documents
-print("📂 Loading SOP documents...")
-# pointing to local directory that is the same level as this project
-docs = load_sop_files("../integreatly-help/sops/")
+def _default_sources() -> list[str]:
+    """Sources from SOP_DIR / SOP_SOURCES, or empty (add via CLI args or web UI)."""
+    env = os.environ.get("SOP_DIR") or os.environ.get("SOP_SOURCES")
+    if not env:
+        return []
+    return [s.strip() for s in env.split(os.pathsep) if s.strip()]
 
 
-splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-chunks = splitter.split_documents(docs)
+@app.route("/")
+def home():
+    return send_from_directory(ROOT, "webapp.html")
 
 
-print("🧠 Creating vector database...")
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-db = Chroma.from_documents(chunks, embeddings)
+@app.route("/api/status")
+def status():
+    return jsonify(
+        {
+            "ready": bool(index and index.ready),
+            "sources": index.list_sources() if index else [],
+        }
+    )
 
 
-retriever = db.as_retriever()
-llm = OllamaLLM(model="mistral")
-qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
+@app.route("/api/sources", methods=["GET"])
+def list_sources():
+    if index is None:
+        return jsonify({"sources": []})
+    return jsonify({"sources": index.list_sources()})
 
 
-print("🤖 SOP Assistant ready. Type your question below. Type 'exit' to quit.")
+@app.route("/api/sources", methods=["POST"])
+def add_source():
+    if index is None:
+        return jsonify({"error": "Assistant is not initialized."}), 503
+
+    data = request.get_json(silent=True) or {}
+    location = (data.get("location") or data.get("path") or data.get("url") or "").strip()
+    if not location:
+        return jsonify({"error": "location is required (directory path or repo URL)."}), 400
+
+    branch = (data.get("branch") or "").strip() or None
+    token = (data.get("token") or "").strip() or None
+
+    try:
+        entry = index.add_source(location, branch=branch, token=token)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    return jsonify({"source": entry, "sources": index.list_sources()}), 201
 
 
-# Chat loop
-while True:
-   query = input("\n📝 You: ")
-   if query.lower() in ("exit", "quit"):
-       print("👋 Bye! Take care.")
-       break
+@app.route("/api/sources/<source_id>", methods=["DELETE"])
+def remove_source(source_id: str):
+    if index is None:
+        return jsonify({"error": "Assistant is not initialized."}), 503
+
+    try:
+        index.remove_source(source_id)
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"sources": index.list_sources()})
 
 
-   result = qa.invoke({"query": query})
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    if index is None or not index.ready:
+        return jsonify({"error": "Add at least one SOP source first."}), 503
+
+    data = request.get_json(silent=True) or {}
+    query = (data.get("message") or data.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "Message is required."}), 400
+
+    try:
+        result = index.ask(query)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify(result)
 
 
-   print("\n🤖 Assistant:\n", result["result"])
+def run_cli(sop_index: SopIndex):
+    print("🤖 SOP Assistant ready. Type your question below. Type 'exit' to quit.")
+    while True:
+        query = input("\n📝 You: ")
+        if query.lower() in ("exit", "quit"):
+            print("👋 Bye! Take care.")
+            break
+
+        result = sop_index.ask(query)
+        print("\n🤖 Assistant:\n", result["answer"])
+        print("\n📎 Sources:")
+        for src in result["sources"]:
+            print(f" - {src}")
 
 
-   print("\n📎 Sources:")
-   for doc in result["source_documents"]:
-       print(f" - {doc.metadata.get('source')}")
+def main():
+    global index
 
+    args = parse_args()
+    locations = args.sources if args.sources else _default_sources()
+
+    if locations:
+        print(f"📚 Initial sources ({len(locations)}):")
+        for loc in locations:
+            print(f"   • {loc}")
+    else:
+        print("📚 No initial sources — add directories/repos via the web UI or pass them as arguments.")
+
+    index = build_index(locations, model=args.model)
+
+    if args.cli:
+        if not index.ready:
+            raise SystemExit(
+                "No sources indexed. Pass at least one valid directory or repo URL, "
+                "or set SOP_DIR / SOP_SOURCES."
+            )
+        run_cli(index)
+        return
+
+    if not index.ready:
+        print("ℹ️  Starting with an empty index — use the Sources panel to add content.")
+
+    print(f"🌐 Web GUI → http://{args.host}:{args.port}")
+    app.run(host=args.host, port=args.port, debug=False)
+
+
+if __name__ == "__main__":
+    main()
