@@ -7,19 +7,23 @@ from flask import Flask, jsonify, request, send_from_directory
 from utils.rag import SopIndex, build_index
 
 ROOT = Path(__file__).resolve().parent
-app = Flask(__name__, static_folder=str(ROOT))
+app = Flask(
+    __name__,
+    static_folder=str(ROOT / "static"),
+    static_url_path="/static",
+)
 index: SopIndex | None = None
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="SOP Assistant — ask questions about local dirs and git repos."
+        description="SOP Assistant — ask questions about local SOP directories."
     )
     parser.add_argument(
         "sources",
         nargs="*",
         default=None,
-        help="One or more SOP directories or GitHub/GitLab URLs.",
+        help="One or more local SOP directories.",
     )
     parser.add_argument(
         "--cli",
@@ -81,15 +85,12 @@ def add_source():
         return jsonify({"error": "Assistant is not initialized."}), 503
 
     data = request.get_json(silent=True) or {}
-    location = (data.get("location") or data.get("path") or data.get("url") or "").strip()
+    location = (data.get("location") or data.get("path") or "").strip()
     if not location:
-        return jsonify({"error": "location is required (directory path or repo URL)."}), 400
-
-    branch = (data.get("branch") or "").strip() or None
-    token = (data.get("token") or "").strip() or None
+        return jsonify({"error": "location is required (local directory path)."}), 400
 
     try:
-        entry = index.add_source(location, branch=branch, token=token)
+        entry = index.add_source(location)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -155,14 +156,14 @@ def main():
         for loc in locations:
             print(f"   • {loc}")
     else:
-        print("📚 No initial sources — add directories/repos via the web UI or pass them as arguments.")
+        print("📚 No initial sources — add directories via the web UI or pass them as arguments.")
 
     index = build_index(locations, model=args.model)
 
     if args.cli:
         if not index.ready:
             raise SystemExit(
-                "No sources indexed. Pass at least one valid directory or repo URL, "
+                "No sources indexed. Pass at least one valid directory, "
                 "or set SOP_DIR / SOP_SOURCES."
             )
         run_cli(index)

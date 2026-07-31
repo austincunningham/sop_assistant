@@ -8,11 +8,39 @@ from pathlib import Path
 from langchain_classic.chains import RetrievalQA
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaLLM
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from utils.loaders import is_remote_repo, load_sop_files
+from utils.loaders import load_sop_files
+
+QA_PROMPT = PromptTemplate.from_template(
+    """Use the following pieces of context to answer the question.
+If you don't know the answer, say you don't know. Do not invent SOPs.
+
+When you include a diagram, use ONE fenced Mermaid block with valid syntax:
+- Prefer a simple flowchart TD (not graph). Put each statement on its own line.
+- Never mix flowchart and sequenceDiagram in the same fence — use two separate fences if needed.
+- Use --> for flowchart arrows (never HTML entities like &gt;). Do not use ->> in flowcharts.
+- Edge labels use -->|label| (not -->|label|>).
+- Do not use "X as Label" aliases or "Note over" / "note right of" inside flowcharts (those are sequenceDiagram only). Use a dashed annotation node instead: N["note"] and A -.-> N
+- Subgraph titles with spaces must be quoted: subgraph "Service Clusters"
+- Subgraph ids use Mermaid form subgraph sc["Title"] (not id="sc")
+- Node ids must be alphanumeric/underscore only (no spaces or /): AWS_GCP_Azure["…"]
+- To link to a subgraph, give it an id: subgraph sc["Service Cluster"] then A --> sc (never A --> subgraph)
+- Node labels with spaces/punctuation must use quotes: A["Label (e.g., note)"]
+- Avoid <br/> in labels; keep edge text short.
+- Do not use a node id named end; use endNode instead.
+- Keep diagrams small (under ~15 nodes) and syntactically valid.
+
+Context:
+{context}
+
+Question: {question}
+
+Helpful answer:"""
+)
 
 
 class SopIndex:
@@ -35,26 +63,16 @@ class SopIndex:
                 "id": s["id"],
                 "kind": s["kind"],
                 "location": s["location"],
-                "branch": s.get("branch"),
                 "doc_count": s.get("doc_count", 0),
             }
             for s in self.sources
         ]
 
     def _normalize_location(self, location: str) -> str:
-        location = location.strip()
-        if is_remote_repo(location):
-            return location.rstrip("/")
-        return str(Path(location).expanduser().resolve())
+        return str(Path(location.strip()).expanduser().resolve())
 
-    def _load_tagged(
-        self,
-        source_id: str,
-        location: str,
-        branch: str | None,
-        token: str | None,
-    ) -> list[Document]:
-        docs = load_sop_files(location, branch=branch, token=token)
+    def _load_tagged(self, source_id: str, location: str) -> list[Document]:
+        docs = load_sop_files(location)
         for doc in docs:
             doc.metadata["source_id"] = source_id
             doc.metadata.setdefault("origin", location)
@@ -73,17 +91,14 @@ class SopIndex:
             llm=self.llm,
             retriever=self.vectorstore.as_retriever(),
             return_source_documents=True,
+            chain_type_kwargs={"prompt": QA_PROMPT},
         )
 
     def _collect_all_docs(self) -> list[Document]:
         """Load all current sources. Does not mutate source metadata."""
         docs: list[Document] = []
         for src in self.sources:
-            docs.extend(
-                self._load_tagged(
-                    src["id"], src["location"], src.get("branch"), src.get("token")
-                )
-            )
+            docs.extend(self._load_tagged(src["id"], src["location"]))
         return docs
 
     def _apply_doc_counts(self, docs: list[Document]) -> None:
@@ -95,43 +110,30 @@ class SopIndex:
         for src in self.sources:
             src["doc_count"] = counts.get(src["id"], 0)
 
-    def add_source(
-        self,
-        location: str,
-        branch: str | None = None,
-        token: str | None = None,
-    ) -> dict:
+    def add_source(self, location: str) -> dict:
         location = self._normalize_location(location)
         for existing in self.sources:
-            if existing["location"] == location and existing.get("branch") == branch:
+            if existing["location"] == location:
                 raise ValueError(f"Source already added: {location}")
 
-        kind = "repo" if is_remote_repo(location) else "directory"
         source_id = uuid.uuid4().hex[:10]
-        print(f"➕ Adding {kind}: {location}")
-        docs = self._load_tagged(source_id, location, branch, token)
+        print(f"➕ Adding directory: {location}")
+        docs = self._load_tagged(source_id, location)
         if not docs:
             raise ValueError(f"No documents found for: {location}")
 
         entry = {
             "id": source_id,
-            "kind": kind,
+            "kind": "directory",
             "location": location,
-            "branch": branch,
-            "token": token,
             "doc_count": len(docs),
         }
 
-        # Keep prior source dicts untouched until rebuild succeeds
         previous = list(self.sources)
         try:
             all_docs: list[Document] = []
             for src in previous:
-                all_docs.extend(
-                    self._load_tagged(
-                        src["id"], src["location"], src.get("branch"), src.get("token")
-                    )
-                )
+                all_docs.extend(self._load_tagged(src["id"], src["location"]))
             all_docs.extend(docs)
             self.sources = previous + [entry]
             self._rebuild_chain(all_docs)
@@ -142,9 +144,8 @@ class SopIndex:
 
         return {
             "id": source_id,
-            "kind": kind,
+            "kind": "directory",
             "location": location,
-            "branch": branch,
             "doc_count": entry["doc_count"],
         }
 

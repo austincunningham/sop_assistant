@@ -7,4 +7,3 @@ langchain-huggingface
 chromadb
 sentence-transformers
 flask
-requests
